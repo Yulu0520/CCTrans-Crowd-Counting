@@ -24,7 +24,7 @@ def cal_new_tensor(img_tensor, min_size=256):
 
 parser = argparse.ArgumentParser(description='Test ')
 parser.add_argument('--device', default='0', help='assign device')
-parser.add_argument('--batch-size', type=int, default=8,
+parser.add_argument('--batch-size', type=int, default=4,
                         help='train batch size')
 parser.add_argument('--crop-size', type=int, default=256,
                     help='the crop size of the train image')

@@ -118,3 +118,7 @@ wandb/
 
 #other project file
 *_test.txt
+
+# Local training checkpoints and pretrained weights
+/ckpts/
+/model_weights/

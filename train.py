@@ -9,7 +9,7 @@ def str2bool(v):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train')
-    parser.add_argument('--data-dir', default='/home/hdd/dataset_xzw/ShanghaiTech/part_A_final', help='data path')
+    parser.add_argument('--data-dir', default='/home/mmslab-1080/Desktop/img2img-turbo/SHA/mix', help='data path')
     parser.add_argument('--dataset', default='sha', help='dataset name: qnrf, nwpu, sha, shb, custom')
     parser.add_argument('--lr', type=float, default=1e-5,
                         help='the initial learning rate')
@@ -21,9 +21,9 @@ def parse_args():
                         help='max training epoch')
     parser.add_argument('--val-epoch', type=int, default=1,
                         help='the num of steps to log training information')
-    parser.add_argument('--val-start', type=int, default=0,
+    parser.add_argument('--val-start', type=int, default=200,
                         help='the epoch start to val')
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=4,
                         help='train batch size')
     parser.add_argument('--device', default='0', help='assign device')
     parser.add_argument('--num-workers', type=int, default=16,

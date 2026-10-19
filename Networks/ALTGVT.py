@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
+from pathlib import Path
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
@@ -230,21 +231,22 @@ class SBlock(TimmBlock):
         return super(SBlock, self).forward(x)
 
 
-class GroupBlock(TimmBlock):
+class GroupBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, sr_ratio=1, ws=1):
 
-        #super(GroupBlock, self).__init__(dim, num_heads, mlp_ratio, qkv_bias, qk_scale, drop, attn_drop,
-        #                                drop_path, act_layer, norm_layer)
-
-        #delete the qk_scale
-        super(GroupBlock, self).__init__(dim, num_heads, mlp_ratio, qkv_bias, drop, attn_drop,
-                                        drop_path, act_layer, norm_layer)
-        del self.attn
+        super().__init__()
+        # Keep the original Twins block and checkpoint keys independent of
+        # timm's changing ViT Block constructor and residual-path attributes.
+        self.norm1 = norm_layer(dim)
         if ws == 1:
             self.attn = Attention(dim, num_heads, qkv_bias, qk_scale, attn_drop, drop, sr_ratio)
         else:
             self.attn = GroupAttention(dim, num_heads, qkv_bias, qk_scale, attn_drop, drop, ws)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
+                       act_layer=act_layer, drop=drop)
 
     def forward(self, x, H, W):
         x = x + self.drop_path(self.attn(self.norm1(x), H, W))
@@ -559,7 +561,13 @@ def alt_gvt_large(pretrained=False, **kwargs):
     model.default_cfg = _cfg()
     if pretrained:
         '''download from https://github.com/Meituan-AutoML/Twins/alt_gvt_large.pth'''
-        checkpoint = torch.load('/train_folder/head_detection/CCTrans/model_weights/alt_gvt_large.pth') # todo pass path as argument
+        weight_path = Path(__file__).resolve().parent.parent / 'model_weights' / 'alt_gvt_large.pth'
+        if not weight_path.is_file():
+            raise FileNotFoundError(
+                f"Pretrained weights not found: {weight_path}. "
+                "Download alt_gvt_large.pth into the project's model_weights directory."
+            )
+        checkpoint = torch.load(weight_path, map_location='cpu')
         model.load_state_dict(checkpoint, strict=False)
         print("load transformer pretrained")
     return model

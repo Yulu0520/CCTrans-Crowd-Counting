@@ -16,6 +16,7 @@ from losses.ot_loss import OT_Loss
 from utils.pytorch_utils import Save_Handle, AverageMeter
 import utils.log_utils as log_utils
 import wandb
+from tqdm.auto import tqdm
 
 
 def train_collate(batch):
@@ -84,13 +85,13 @@ class Trainer(object):
         elif args.dataset.lower() == "sha" or args.dataset.lower() == "shb":
             self.datasets = {
                 "train": Crowd_sh(
-                    os.path.join(args.data_dir, "train_data"),
+                    os.path.join(args.data_dir, "train"),
                     args.crop_size,
                     downsample_ratio,
                     "train",
                 ),
                 "val": Crowd_sh(
-                    os.path.join(args.data_dir, "test_data"),
+                    os.path.join(args.data_dir, "val"),
                     args.crop_size,
                     downsample_ratio,
                     "val",
@@ -191,7 +192,12 @@ class Trainer(object):
         epoch_start = time.time()
         self.model.train()  # Set model to training mode
 
-        for step, (inputs, points, gt_discrete) in enumerate(self.dataloaders["train"]):
+        progress = tqdm(
+            self.dataloaders["train"],
+            desc=f"Epoch {self.epoch}/{self.args.max_epoch} Train",
+            unit="batch", dynamic_ncols=True,
+        )
+        for step, (inputs, points, gt_discrete) in enumerate(progress):
             inputs = inputs.to(self.device)
             gd_count = np.array([len(p) for p in points], dtype=np.float32)
             points = [p.to(self.device) for p in points]
@@ -250,6 +256,14 @@ class Trainer(object):
                 epoch_loss.update(loss.item(), N)
                 epoch_mse.update(np.mean(pred_err * pred_err), N)
                 epoch_mae.update(np.mean(abs(pred_err)), N)
+                progress.set_postfix(
+                    loss=f"{epoch_loss.get_avg():.3f}",
+                    count=f"{epoch_count_loss.get_avg():.3f}",
+                    ot=f"{epoch_ot_loss.get_avg():.3f}",
+                    tv=f"{epoch_tv_loss.get_avg():.3f}",
+                    mae=f"{epoch_mae.get_avg():.2f}",
+                    refresh=False,
+                )
 
                 # log wandb
                 wandb.log(
@@ -295,7 +309,14 @@ class Trainer(object):
         epoch_start = time.time()
         self.model.eval()  # Set model to evaluate mode
         epoch_res = []
-        for inputs, count, name in self.dataloaders["val"]:
+        val_abs_error = 0.0
+        val_squared_error = 0.0
+        progress = tqdm(
+            self.dataloaders["val"],
+            desc=f"Epoch {self.epoch}/{args.max_epoch} Val",
+            unit="image", dynamic_ncols=True,
+        )
+        for inputs, count, name in progress:
             with torch.no_grad():
                 # nputs = cal_new_tensor(inputs, min_size=args.crop_size)
                 inputs = inputs.to(self.device)
@@ -349,6 +370,13 @@ class Trainer(object):
 
                 res = count[0].item() - torch.sum(outputs).item()
                 epoch_res.append(res)
+                val_abs_error += abs(res)
+                val_squared_error += res * res
+                progress.set_postfix(
+                    mae=f"{val_abs_error / len(epoch_res):.2f}",
+                    rmse=f"{np.sqrt(val_squared_error / len(epoch_res)):.2f}",
+                    refresh=False,
+                )
         epoch_res = np.array(epoch_res)
         mse = np.sqrt(np.mean(np.square(epoch_res)))
         mae = np.mean(np.abs(epoch_res))

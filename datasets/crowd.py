@@ -171,7 +171,17 @@ class Crowd_sh(Base):
         if method not in ['train', 'val']:
             raise Exception("not implement")
 
-        self.im_list = sorted(glob(os.path.join(self.root_path, 'images', '*.jpg')))
+        # Support both the original ShanghaiTech layout and flat jpg/npy splits.
+        image_dir = os.path.join(self.root_path, 'images')
+        self.flat_layout = not os.path.isdir(image_dir)
+        if self.flat_layout:
+            image_dir = self.root_path
+        self.im_list = sorted(glob(os.path.join(image_dir, '*.jpg')))
+        if not self.im_list:
+            raise ValueError(
+                "No ShanghaiTech images found in {!r} (expected *.jpg). "
+                "Check --data-dir and the train/val split directories.".format(image_dir)
+            )
 
         print('number of img [{}]: {}'.format(method, len(self.im_list)))
 
@@ -181,9 +191,20 @@ class Crowd_sh(Base):
     def __getitem__(self, item):
         img_path = self.im_list[item]
         name = os.path.basename(img_path).split('.')[0]
-        gd_path = os.path.join(self.root_path, 'ground-truth', 'GT_{}.mat'.format(name))
         img = Image.open(img_path).convert('RGB')
-        keypoints = sio.loadmat(gd_path)['image_info'][0][0][0][0][0]
+        if self.flat_layout:
+            gd_path = os.path.splitext(img_path)[0] + '.npy'
+            keypoints = np.load(gd_path)
+            if keypoints.ndim != 2 or keypoints.shape[1] < 2:
+                raise ValueError(
+                    "Expected an (N, 2+) point array in {!r}, got {}".format(
+                        gd_path, keypoints.shape
+                    )
+                )
+            keypoints = keypoints[:, :2].copy()
+        else:
+            gd_path = os.path.join(self.root_path, 'ground-truth', 'GT_{}.mat'.format(name))
+            keypoints = sio.loadmat(gd_path)['image_info'][0][0][0][0][0]
         if self.method == 'train':
             return self.train_transform(img, keypoints)
         elif self.method == 'val':
