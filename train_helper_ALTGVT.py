@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import torch
 import torch.nn as nn
@@ -12,8 +13,14 @@ from datasets.crowd import Crowd_qnrf, Crowd_nwpu, Crowd_sh, CustomDataset
 
 # from models import vgg19
 from Networks import ALTGVT
+from Networks.dora import ADAPTERS, attach_dora, configure_training
+from utils.dora_options import settings_from_args
+from utils.dora_checkpoint import (
+    file_identity, load_baseline, read_checkpoint, restore_adapter, save_adapter,
+)
 from losses.ot_loss import OT_Loss
-from utils.pytorch_utils import Save_Handle, AverageMeter
+from utils.pytorch_utils import AverageMeter
+from utils.training_state import capture_random_state, restore_random_state
 import utils.log_utils as log_utils
 import wandb
 from tqdm.auto import tqdm
@@ -32,6 +39,10 @@ def train_collate(batch):
 class Trainer(object):
     def __init__(self, args):
         self.args = args
+        self.stage = getattr(args, "stage", "baseline")
+        self.best_model_path = None
+        self.latest_checkpoint_path = None
+        self.resumed_best_model_path = None
 
     def setup(self):
         args = self.args
@@ -47,7 +58,11 @@ class Trainer(object):
             )
         )
 
-        self.save_dir = os.path.join("ckpts", sub_dir)
+        sub_dir += "_density-{}_wl2-{}_beta-{}_sigma-{}".format(
+            args.density_loss, args.wl2, args.gaussian_beta, args.gaussian_sigma
+        )
+        time_str = datetime.strftime(datetime.now(), "%m%d-%H%M%S-%f")
+        self.save_dir = os.path.join(args.save_dir, sub_dir, self.stage, time_str)
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
@@ -66,32 +81,37 @@ class Trainer(object):
             raise Exception("gpu is not available")
 
         downsample_ratio = 8
+        if self.stage == "baseline":
+            train_root = os.path.join(args.data_dir, "train")
+            val_root = os.path.join(args.data_dir, "val")
+        else:
+            prefix = self.stage.replace("-", "_")
+            train_root = getattr(args, prefix + "_train_dir")
+            val_root = getattr(args, prefix + "_val_dir")
         if args.dataset.lower() == "qnrf":
             self.datasets = {
                 x: Crowd_qnrf(
-                    os.path.join(
-                        args.data_dir, x), args.crop_size, downsample_ratio, x
+                    {"train": train_root, "val": val_root}[x], args.crop_size, downsample_ratio, x
                 )
                 for x in ["train", "val"]
             }
         elif args.dataset.lower() == "nwpu":
             self.datasets = {
                 x: Crowd_nwpu(
-                    os.path.join(
-                        args.data_dir, x), args.crop_size, downsample_ratio, x
+                    {"train": train_root, "val": val_root}[x], args.crop_size, downsample_ratio, x
                 )
                 for x in ["train", "val"]
             }
         elif args.dataset.lower() == "sha" or args.dataset.lower() == "shb":
             self.datasets = {
                 "train": Crowd_sh(
-                    os.path.join(args.data_dir, "train"),
+                    train_root,
                     args.crop_size,
                     downsample_ratio,
                     "train",
                 ),
                 "val": Crowd_sh(
-                    os.path.join(args.data_dir, "val"),
+                    val_root,
                     args.crop_size,
                     downsample_ratio,
                     "val",
@@ -100,14 +120,21 @@ class Trainer(object):
         elif args.dataset.lower() == "custom":
             self.datasets = {
                 "train": CustomDataset(
-                    args.data_dir, args.crop_size, downsample_ratio, method="train"
+                    (args.data_dir if self.stage == "baseline" else train_root),
+                    args.crop_size, downsample_ratio, method="train"
                 ),
                 "val": CustomDataset(
-                    args.data_dir, args.crop_size, downsample_ratio, method="valid"
+                    (args.data_dir if self.stage == "baseline" else val_root),
+                    args.crop_size, downsample_ratio, method="valid"
                 ),
             }
         else:
             raise NotImplementedError
+
+        train_dataset = self.datasets["train"]
+        train_dataset.density_loss = args.density_loss
+        train_dataset.gaussian_beta = args.gaussian_beta
+        train_dataset.gaussian_sigma = args.gaussian_sigma
 
         self.dataloaders = {
             x: DataLoader(
@@ -121,36 +148,56 @@ class Trainer(object):
             )
             for x in ["train", "val"]
         }
-        self.model = ALTGVT.alt_gvt_large(pretrained=True)
-        self.model.to(self.device)
-        self.optimizer = optim.AdamW(
-            self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-        )
         self.start_epoch = 0
-
-        # check if wandb has to log
-        if args.wandb:
-            self.wandb_run = wandb.init(
-            config=args, project="CTTrans", name=args.run_name
-        )
-        else : 
-            wandb.init(mode="disabled")
-    
-
-        if args.resume:
-            self.logger.info("loading pretrained model from " + args.resume)
-            suf = args.resume.rsplit(".", 1)[-1]
-            if suf == "tar":
-                checkpoint = torch.load(args.resume, self.device)
-                self.model.load_state_dict(checkpoint["model_state_dict"])
-                self.optimizer.load_state_dict(
-                    checkpoint["optimizer_state_dict"])
-                self.start_epoch = checkpoint["epoch"] + 1
-            elif suf == "pth":
-                self.model.load_state_dict(
-                    torch.load(args.resume, self.device))
+        self.best_mae = np.inf
+        self.best_mse = np.inf
+        resume = read_checkpoint(args.resume) if args.resume else None
+        if resume is not None and resume.get("stage", self.stage) != self.stage:
+            raise ValueError("Resume checkpoint belongs to a different training stage")
+        self.model = ALTGVT.alt_gvt_large(
+            pretrained=(self.stage == "baseline" and resume is None))
+        if self.stage == "baseline":
+            if args.resume:
+                load_baseline(self.model, args.resume)
         else:
-            self.logger.info("random initialization")
+            baseline_path = args.baseline_checkpoint
+            if not baseline_path and resume is not None:
+                baseline_path = resume.get("baseline", {}).get("path", "")
+            if not baseline_path:
+                raise ValueError("Provide a trained baseline checkpoint")
+            load_baseline(self.model, baseline_path)
+            self.baseline_identity = file_identity(baseline_path)
+            attach_dora(self.model, settings_from_args(args))
+            for name in ADAPTERS:
+                path = getattr(args, name.replace("-", "_") + "_checkpoint")
+                if path:
+                    restore_adapter(self.model, read_checkpoint(path), name, self.baseline_identity)
+            if resume is not None:
+                restore_adapter(self.model, resume, self.stage, self.baseline_identity)
+        self.model.to(self.device)
+        configure_training(self.model, self.stage)
+        trainable = [parameter for parameter in self.model.parameters() if parameter.requires_grad]
+        self.optimizer = optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+        if resume is not None and "optimizer_state_dict" in resume:
+            self.optimizer.load_state_dict(resume["optimizer_state_dict"])
+            # CLI learning rate and decay deliberately override the saved optimizer settings.
+            for group in self.optimizer.param_groups:
+                group.update(lr=args.lr, weight_decay=args.weight_decay)
+            self.start_epoch = resume["epoch"] + 1
+            self.best_mae = resume.get("best_mae", np.inf)
+            self.best_mse = resume.get("best_mse", np.inf)
+            self.resumed_best_model_path = resume.get("best_model_path")
+        self.logger.info("stage=%s, trainable parameters=%d", self.stage,
+                         sum(parameter.numel() for parameter in trainable))
+        config = dict(vars(args))
+        if self.stage != "baseline":
+            config["baseline"] = self.baseline_identity
+        with open(os.path.join(self.save_dir, "config.json"), "w") as stream:
+            json.dump(config, stream, indent=2)
+        if args.wandb:
+            self.wandb_run = wandb.init(config=config, project="CTTrans", name=args.run_name + "/" + self.stage)
+        else:
+            wandb.init(mode="disabled")
 
         self.ot_loss = OT_Loss(
             args.crop_size,
@@ -163,10 +210,9 @@ class Trainer(object):
         self.tv_loss = nn.L1Loss(reduction="none").to(self.device)
         self.mse = nn.MSELoss().to(self.device)
         self.mae = nn.L1Loss().to(self.device)
-        self.save_list = Save_Handle(max_num=1)
-        self.best_mae = np.inf
-        self.best_mse = np.inf
-        # self.best_count = 0
+        # Best metrics are restored above when resuming.
+        if resume is not None and "optimizer_state_dict" in resume and "random_state" in resume:
+            restore_random_state(resume["random_state"])
 
     def train(self):
         """training process"""
@@ -179,18 +225,32 @@ class Trainer(object):
             self.train_epoch()
             if epoch % args.val_epoch == 0 and epoch >= args.val_start:
                 self.val_epoch()
+            self.save_latest_checkpoint()
+
+    def compute_density_loss(self, outputs, outputs_normed, target, counts):
+        if outputs.shape != target.shape:
+            raise ValueError("Prediction and density target shapes differ: {} vs {}".format(
+                outputs.shape, target.shape
+            ))
+        if self.args.density_loss == "l2":
+            # Mean over batch, channel and pixels; targets retain their head count.
+            return self.mse(outputs, target) * self.args.wl2
+        target_normed = target / (counts[:, None, None, None] + 1e-6)
+        return (
+            self.tv_loss(outputs_normed, target_normed).sum(dim=(1, 2, 3)) * counts
+        ).mean() * self.args.wtv
 
     def train_epoch(self):
         epoch_ot_loss = AverageMeter()
         epoch_ot_obj_value = AverageMeter()
         epoch_wd = AverageMeter()
         epoch_count_loss = AverageMeter()
-        epoch_tv_loss = AverageMeter()
+        epoch_density_loss = AverageMeter()
         epoch_loss = AverageMeter()
         epoch_mae = AverageMeter()
         epoch_mse = AverageMeter()
         epoch_start = time.time()
-        self.model.train()  # Set model to training mode
+        configure_training(self.model, self.stage)
 
         progress = tqdm(
             self.dataloaders["train"],
@@ -223,26 +283,13 @@ class Trainer(object):
                 )
                 epoch_count_loss.update(count_loss.item(), N)
 
-                # Compute TV loss.
-                gd_count_tensor = (
-                    torch.from_numpy(gd_count)
-                    .float()
-                    .to(self.device)
-                    .unsqueeze(1)
-                    .unsqueeze(2)
-                    .unsqueeze(3)
+                density_loss = self.compute_density_loss(
+                    outputs, outputs_normed, gt_discrete,
+                    torch.from_numpy(gd_count).float().to(self.device),
                 )
-                gt_discrete_normed = gt_discrete / (gd_count_tensor + 1e-6)
-                tv_loss = (
-                    self.tv_loss(outputs_normed, gt_discrete_normed)
-                    .sum(1)
-                    .sum(1)
-                    .sum(1)
-                    * torch.from_numpy(gd_count).float().to(self.device)
-                ).mean(0) * self.args.wtv
-                epoch_tv_loss.update(tv_loss.item(), N)
+                epoch_density_loss.update(density_loss.item(), N)
 
-                loss = ot_loss + count_loss + tv_loss
+                loss = ot_loss + count_loss + density_loss
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -260,7 +307,7 @@ class Trainer(object):
                     loss=f"{epoch_loss.get_avg():.3f}",
                     count=f"{epoch_count_loss.get_avg():.3f}",
                     ot=f"{epoch_ot_loss.get_avg():.3f}",
-                    tv=f"{epoch_tv_loss.get_avg():.3f}",
+                    **{self.args.density_loss: f"{epoch_density_loss.get_avg():.3f}"},
                     mae=f"{epoch_mae.get_avg():.2f}",
                     refresh=False,
                 )
@@ -270,7 +317,8 @@ class Trainer(object):
                     {
                         "train/TOTAL_loss": loss,
                         "train/count_loss": count_loss,
-                        "train/tv_loss": tv_loss,
+                        "train/ot_loss": ot_loss,
+                        "train/{}_loss".format(self.args.density_loss): density_loss,
                         "train/pred_err": pred_err,
                     },
                     step=self.epoch,
@@ -278,31 +326,79 @@ class Trainer(object):
 
         self.logger.info(
             "Epoch {} Train, Loss: {:.2f}, OT Loss: {:.2e}, Wass Distance: {:.2f}, OT obj value: {:.2f}, "
-            "Count Loss: {:.2f}, TV Loss: {:.2f}, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec".format(
+            "Count Loss: {:.2f}, {} Loss: {:.2f}, MSE: {:.2f} MAE: {:.2f}, Cost {:.1f} sec".format(
                 self.epoch,
                 epoch_loss.get_avg(),
                 epoch_ot_loss.get_avg(),
                 epoch_wd.get_avg(),
                 epoch_ot_obj_value.get_avg(),
                 epoch_count_loss.get_avg(),
-                epoch_tv_loss.get_avg(),
+                self.args.density_loss.upper(),
+                epoch_density_loss.get_avg(),
                 np.sqrt(epoch_mse.get_avg()),
                 epoch_mae.get_avg(),
                 time.time() - epoch_start,
             )
         )
-        model_state_dic = self.model.state_dict()
-        save_path = os.path.join(
-            self.save_dir, "{}_ckpt.tar".format(self.epoch))
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "model_state_dict": model_state_dic,
-            },
-            save_path,
+
+    def save_latest_checkpoint(self):
+        """Keep one complete epoch-boundary resume file, independently of best weights."""
+        path = os.path.join(self.save_dir, "{}_last_epoch-{}.ckpt".format(self.stage, self.epoch + 1))
+        temporary_path = path + ".tmp"
+        best_path = self.best_model_path or self.resumed_best_model_path
+        state = dict(
+            stage=self.stage, epoch=self.epoch,
+            best_mae=float(self.best_mae), best_mse=float(self.best_mse),
+            best_model_path=os.path.abspath(best_path) if best_path else None,
+            optimizer_state_dict=self.optimizer.state_dict(),
+            random_state=capture_random_state(),
         )
-        self.save_list.append(save_path)
+        try:
+            if self.stage == "baseline":
+                torch.save(dict(state, model_state_dict=self.model.state_dict(),
+                                train_config=vars(self.args).copy()), temporary_path)
+            else:
+                save_adapter(temporary_path, self.model, self.stage, self.baseline_identity,
+                             vars(self.args).copy(), **state)
+            os.replace(temporary_path, path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        previous_path = self.latest_checkpoint_path
+        self.latest_checkpoint_path = path
+        if previous_path and previous_path != path and os.path.isfile(previous_path):
+            os.remove(previous_path)
+        self.logger.info("Saved resume checkpoint: epoch %d -> %s", self.epoch + 1, path)
+
+    def save_best_model(self, mae, mse):
+        """Save a new best before removing this run's previous best checkpoint."""
+        if not np.isfinite(mae) or mae >= self.best_mae:
+            return None
+        prefix = "best_model" if self.stage == "baseline" else self.stage + "_best"
+        filename = "{}_mae-{:.2f}_epoch-{}.pth".format(prefix, mae, self.epoch + 1)
+        model_path = os.path.join(self.save_dir, filename)
+        temporary_path = model_path + ".tmp"
+        try:
+            if self.stage == "baseline":
+                torch.save(self.model.state_dict(), temporary_path)
+            else:
+                save_adapter(
+                    temporary_path, self.model, self.stage, self.baseline_identity,
+                    vars(self.args).copy(), epoch=self.epoch,
+                    best_mae=float(mae), best_mse=float(mse),
+                )
+            os.replace(temporary_path, model_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        previous_path = self.best_model_path
+        self.best_model_path = model_path
+        self.best_mae, self.best_mse = float(mae), float(mse)
+        if previous_path and previous_path != model_path and os.path.isfile(previous_path):
+            os.remove(previous_path)
+        self.logger.info("Saved best weights: epoch %d, MAE %.4f, RMSE %.4f -> %s",
+                         self.epoch + 1, mae, mse, model_path)
+        return model_path
 
     def val_epoch(self):
         args = self.args
@@ -390,35 +486,11 @@ class Trainer(object):
         # log wandb
         wandb.log({"val/MSE": mse, "val/MAE": mae}, step=self.epoch)
 
-        model_state_dic = self.model.state_dict()
-        # if (2.0 * mse + mae) < (2.0 * self.best_mse + self.best_mae):
-        print("Comaprison", mae,  self.best_mae)
-        if mae < self.best_mae:
-            self.best_mse = mse
-            self.best_mae = mae
-            self.logger.info(
-                "save best mse {:.2f} mae {:.2f} model epoch {}".format(
-                    self.best_mse, self.best_mae, self.epoch
-                )
-            )
-            print("Saving best model at {} epoch".format(self.epoch))
-            model_path = os.path.join(
-                self.save_dir, "best_model_mae-{:.2f}_epoch-{}.pth".format(
-                    self.best_mae, self.epoch)
-            )
-            torch.save(
-                model_state_dic,
-                model_path,
-            )
-
-            if args.wandb:
-                artifact = wandb.Artifact("model", type="model")
-                artifact.add_file(model_path)
-                
-                self.wandb_run.log_artifact(artifact)
-            
-            # torch.save(model_state_dic, os.path.join(self.save_dir, 'best_model_{}.pth'.format(self.best_count)))
-            # self.best_count += 1
+        model_path = self.save_best_model(mae, mse)
+        if model_path and args.wandb:
+            artifact = wandb.Artifact("model", type="model")
+            artifact.add_file(model_path)
+            self.wandb_run.log_artifact(artifact)
 
 
 def tensor_divideByfactor(img_tensor, factor=32):

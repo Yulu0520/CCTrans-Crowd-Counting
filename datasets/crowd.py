@@ -8,6 +8,7 @@ from torchvision import transforms
 import random
 import numpy as np
 import scipy.io as sio
+from datasets.density import gen_gaussian_map
 
 
 def random_crop(im_h, im_w, crop_h, crop_w):
@@ -54,6 +55,9 @@ class Base(data.Dataset):
         self.d_ratio = downsample_ratio
         assert self.c_size % self.d_ratio == 0
         self.dc_size = self.c_size // self.d_ratio
+        self.density_loss = "tv"
+        self.gaussian_beta = 0.3
+        self.gaussian_sigma = 15.0
         self.trans = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -65,6 +69,18 @@ class Base(data.Dataset):
     def __getitem__(self, item):
         pass
 
+    def make_density_target(self, height, width, keypoints):
+        if self.density_loss == "l2":
+            return gen_gaussian_map(
+                height, width, keypoints, self.d_ratio,
+                self.gaussian_beta, self.gaussian_sigma,
+            )
+        discrete = gen_discrete_map(height, width, keypoints)
+        return discrete.reshape(
+            height // self.d_ratio, self.d_ratio,
+            width // self.d_ratio, self.d_ratio,
+        ).sum(axis=(1, 3))
+
     def train_transform(self, img, keypoints):
         wd, ht = img.size
         st_size = 1.0 * min(wd, ht)
@@ -74,23 +90,20 @@ class Base(data.Dataset):
         img = F.crop(img, i, j, h, w)
         if len(keypoints) > 0:
             keypoints = keypoints - [j, i]
-            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] <= w) * \
-                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] <= h)
+            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] < w) * \
+                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] < h)
             keypoints = keypoints[idx_mask]
         else:
             keypoints = np.empty([0, 2])
 
-        gt_discrete = gen_discrete_map(h, w, keypoints)
-        down_w = w // self.d_ratio
-        down_h = h // self.d_ratio
-        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
-        assert np.sum(gt_discrete) == len(keypoints)
+        gt_discrete = self.make_density_target(h, w, keypoints)
+        assert np.isclose(np.sum(gt_discrete), len(keypoints), rtol=1e-5, atol=1e-5)
 
         if len(keypoints) > 0:
             if random.random() > 0.5:
                 img = F.hflip(img)
                 gt_discrete = np.fliplr(gt_discrete)
-                keypoints[:, 0] = w - keypoints[:, 0]
+                keypoints[:, 0] = w - keypoints[:, 0] - 1
         else:
             if random.random() > 0.5:
                 img = F.hflip(img)
@@ -236,17 +249,14 @@ class Crowd_sh(Base):
         img = F.crop(img, i, j, h, w)
         if len(keypoints) > 0:
             keypoints = keypoints - [j, i]
-            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] <= w) * \
-                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] <= h)
+            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] < w) * \
+                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] < h)
             keypoints = keypoints[idx_mask]
         else:
             keypoints = np.empty([0, 2])
 
-        gt_discrete = gen_discrete_map(h, w, keypoints)
-        down_w = w // self.d_ratio
-        down_h = h // self.d_ratio
-        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
-        assert np.sum(gt_discrete) == len(keypoints)
+        gt_discrete = self.make_density_target(h, w, keypoints)
+        assert np.isclose(np.sum(gt_discrete), len(keypoints), rtol=1e-5, atol=1e-5)
 
         if len(keypoints) > 0:
             if random.random() > 0.5:
@@ -352,17 +362,14 @@ class CustomDataset(Base):
         img = F.crop(img, i, j, h, w)
         if len(keypoints) > 0:
             keypoints = keypoints - [j, i]
-            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] <= w) * \
-                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] <= h)
+            idx_mask = (keypoints[:, 0] >= 0) * (keypoints[:, 0] < w) * \
+                       (keypoints[:, 1] >= 0) * (keypoints[:, 1] < h)
             keypoints = keypoints[idx_mask]
         else:
             keypoints = np.empty([0, 2])
 
-        gt_discrete = gen_discrete_map(h, w, keypoints)
-        down_w = w // self.d_ratio
-        down_h = h // self.d_ratio
-        gt_discrete = gt_discrete.reshape([down_h, self.d_ratio, down_w, self.d_ratio]).sum(axis=(1, 3))
-        assert np.sum(gt_discrete) == len(keypoints)
+        gt_discrete = self.make_density_target(h, w, keypoints)
+        assert np.isclose(np.sum(gt_discrete), len(keypoints), rtol=1e-5, atol=1e-5)
 
         if len(keypoints) > 0:
             if random.random() > 0.5:

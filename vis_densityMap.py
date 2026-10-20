@@ -4,6 +4,7 @@
 # @File     : vis_densityMap.py
 # @Software : PyCharm
 from Networks import ALTGVT
+from utils.dora_checkpoint import add_inference_arguments, load_for_inference
 import numpy as np
 from torch.autograd import Variable
 import torchvision.transforms as transforms
@@ -24,9 +25,12 @@ def vis(args):
     crop_size = args.crop_size
     image_path = args.image_path
 
-    model = ALTGVT.alt_gvt_large(pretrained=True)
+    model = ALTGVT.alt_gvt_large(pretrained=False)
+    load_for_inference(
+        model, model_path, args.baseline_checkpoint,
+        args.dora_day_checkpoint, args.dora_night_checkpoint, args.adapter_route,
+    )
     model.to(device)
-    model.load_state_dict(torch.load(model_path, device))
     model.eval()
 
     if not os.path.exists(image_path):
@@ -123,6 +127,7 @@ def vis(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    add_inference_arguments(parser)
     parser.add_argument('--device', default='0', help='assign device')
     parser.add_argument("--image_path", type=str, required=True,
                         help="the image path to be detected.")
